@@ -42,8 +42,11 @@ struct Args {
 /// A socket request line longer than this is refused; nothing legitimate comes close
 /// (send_file carries a path, not the file).
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
-/// Requests handled at the same time on one connection.
-const MAX_IN_FLIGHT: usize = 8;
+/// Requests handled at the same time on one connection. The shell asks for
+/// several things at once, and one slow optional lookup (a space alias behind
+/// a homeserver that cannot federate) must not stop the next request from
+/// being read: while this many are running, the reader waits.
+const MAX_IN_FLIGHT: usize = 32;
 
 fn default_socket() -> Result<PathBuf> {
     let dir = std::env::var_os("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR is not set")?;

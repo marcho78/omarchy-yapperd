@@ -358,6 +358,78 @@ pub enum Command {
     },
 }
 
+impl Command {
+    /// The wire name, for logging. `Debug` is not usable: it would put
+    /// message bodies and passwords in the journal.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Status { .. } => "status",
+            Self::Login { .. } => "login",
+            Self::LoginOauth { .. } => "login_oauth",
+            Self::LoginCancel { .. } => "login_cancel",
+            Self::RetrySession { .. } => "retry_session",
+            Self::ForgetSession { .. } => "forget_session",
+            Self::Logout { .. } => "logout",
+            Self::Rooms { .. } => "rooms",
+            Self::Timeline { .. } => "timeline",
+            Self::Send { .. } => "send",
+            Self::Thread { .. } => "thread",
+            Self::Edit { .. } => "edit",
+            Self::Delete { .. } => "delete",
+            Self::React { .. } => "react",
+            Self::Unreact { .. } => "unreact",
+            Self::Typing { .. } => "typing",
+            Self::RoomDetails { .. } => "room_details",
+            Self::Members { .. } => "members",
+            Self::Avatar { .. } => "avatar",
+            Self::Invite { .. } => "invite",
+            Self::Kick { .. } => "kick",
+            Self::Ban { .. } => "ban",
+            Self::SetName { .. } => "set_name",
+            Self::SetTopic { .. } => "set_topic",
+            Self::SetNotificationMode { .. } => "set_notification_mode",
+            Self::SetFavourite { .. } => "set_favourite",
+            Self::Spaces { .. } => "spaces",
+            Self::Preview { .. } => "preview",
+            Self::Search { .. } => "search",
+            Self::MarkRead { .. } => "mark_read",
+            Self::CommunityStatus { .. } => "community_status",
+            Self::CommunityJoin { .. } => "community_join",
+            Self::CommunityLeave { .. } => "community_leave",
+            Self::PublishProfile { .. } => "publish_profile",
+            Self::ClearProfile { .. } => "clear_profile",
+            Self::People { .. } => "people",
+            Self::Ignore { .. } => "ignore",
+            Self::Unignore { .. } => "unignore",
+            Self::Ignored { .. } => "ignored",
+            Self::SetDmPolicy { .. } => "set_dm_policy",
+            Self::CreateSpace { .. } => "create_space",
+            Self::AddSpaceChild { .. } => "add_space_child",
+            Self::SearchRooms { .. } => "search_rooms",
+            Self::Explore { .. } => "explore",
+            Self::Join { .. } => "join",
+            Self::SearchUsers { .. } => "search_users",
+            Self::Dm { .. } => "dm",
+            Self::CreateRoom { .. } => "create_room",
+            Self::Invites { .. } => "invites",
+            Self::VerificationStatus { .. } => "verification_status",
+            Self::VerifyRequest { .. } => "verify_request",
+            Self::VerifyAccept { .. } => "verify_accept",
+            Self::VerifyConfirm { .. } => "verify_confirm",
+            Self::VerifyCancel { .. } => "verify_cancel",
+            Self::Recover { .. } => "recover",
+            Self::SetupRecovery { .. } => "setup_recovery",
+            Self::ResetRecoveryKey { .. } => "reset_recovery_key",
+            Self::Download { .. } => "download",
+            Self::SendVoice { .. } => "send_voice",
+            Self::SendFile { .. } => "send_file",
+            Self::AcceptInvite { .. } => "accept_invite",
+            Self::DeclineInvite { .. } => "decline_invite",
+            Self::Leave { .. } => "leave",
+        }
+    }
+}
+
 fn default_limit() -> u32 {
     50
 }

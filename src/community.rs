@@ -38,6 +38,12 @@ const HIERARCHY_TTL: Duration = Duration::from_secs(5 * 60);
 /// How long a refused listing (not a member, space not readable) is
 /// remembered, so status refreshes do not ask again every time.
 const HIERARCHY_FAILURE_TTL: Duration = Duration::from_secs(60);
+/// How long a successful [`status`] is reused. A refresh only needs to see
+/// joins, leaves and new cards; it does not need to resolve the alias again.
+const STATUS_TTL: Duration = Duration::from_secs(30);
+/// A failed lookup is remembered for this long: a space whose server is
+/// unreachable used to cost a 30 s retry storm on every refresh.
+const STATUS_FAILURE_TTL: Duration = Duration::from_secs(60);
 /// Pause between joining one community room and the next: matrix.org allows a
 /// short burst of joins, then about one every ten seconds.
 const JOIN_SPACING: Duration = Duration::from_secs(5);
@@ -50,6 +56,11 @@ const JOIN_ATTEMPTS: u32 = 5;
 pub struct CommunityState {
     /// Space hierarchies by alias, with when they were fetched.
     hierarchy: tokio::sync::Mutex<HashMap<String, CachedHierarchy>>,
+    /// Whole status answers (successes and failures) by alias, so a burst
+    /// of refreshes is one lookup and not one per request.
+    status: tokio::sync::Mutex<HashMap<String, CachedStatus>>,
+    /// One lookup per alias at a time; concurrent callers wait for it.
+    status_locks: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Rooms the background joiner still has to join.
     joining: AtomicU32,
     /// The background joiner, so a leave can stop it.
@@ -68,12 +79,20 @@ struct CachedHierarchy {
     rooms: Vec<CommunityRoom>,
 }
 
+#[derive(Clone)]
+struct CachedStatus {
+    fetched: Instant,
+    /// The error is kept as text so the entry stays cloneable.
+    result: Result<CommunityStatus, String>,
+}
+
 impl CommunityState {
     pub fn joining(&self) -> u32 {
         self.joining.load(Ordering::Relaxed)
     }
-    async fn forget(&self, alias: &str) {
+    pub(crate) async fn forget(&self, alias: &str) {
         self.hierarchy.lock().await.remove(alias);
+        self.status.lock().await.remove(alias);
     }
     /// Stop a joiner that is still working (on leave).
     async fn stop_joiner(&self) {
@@ -172,7 +191,16 @@ pub async fn space_id(client: &Client, alias: &str) -> Result<Option<OwnedRoomId
     }) {
         return Ok(Some(room.room_id().to_owned()));
     }
-    match client.resolve_room_alias(&alias).await {
+    use matrix_sdk::ruma::api::client::alias::get_alias;
+    let request = get_alias::v3::Request::new(alias.clone());
+    // A dead alias (or one behind a homeserver that cannot federate) is an
+    // optional detail, not a reason to hold a refresh for half a minute.
+    let lookup = client.send(request).with_request_config(
+        matrix_sdk::config::RequestConfig::new()
+            .timeout(Duration::from_secs(10))
+            .retry_limit(0),
+    );
+    match lookup.await {
         Ok(resp) => Ok(Some(resp.room_id)),
         Err(e)
             if e.as_client_api_error()
@@ -259,8 +287,58 @@ async fn hierarchy(
     Ok(fresh)
 }
 
-/// Everything the client shows about the community at once.
+/// Everything the client shows about the community at once, reused for
+/// [`STATUS_TTL`] and shared between concurrent callers. Resolving the alias
+/// is a network request; a shell that refreshes the room list may ask many
+/// times in a row, and a dead alias would otherwise stall the socket.
 pub async fn status(
+    client: &Client,
+    state: &CommunityState,
+    alias: &str,
+    prefs: &Prefs,
+) -> Result<CommunityStatus> {
+    if let Some(hit) = cached_status(state, alias).await {
+        return hit.map_err(anyhow::Error::msg);
+    }
+    // One lookup per alias: everybody else waits here and takes the result.
+    let gate = {
+        let mut locks = state.status_locks.lock().await;
+        locks
+            .entry(alias.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    let _guard = gate.lock().await;
+    if let Some(hit) = cached_status(state, alias).await {
+        return hit.map_err(anyhow::Error::msg);
+    }
+    let result = status_uncached(client, state, alias, prefs).await;
+    let cached = result.as_ref().map_err(|e| format!("{e:#}")).cloned();
+    state.status.lock().await.insert(
+        alias.to_owned(),
+        CachedStatus {
+            fetched: Instant::now(),
+            result: cached,
+        },
+    );
+    result
+}
+
+async fn cached_status(
+    state: &CommunityState,
+    alias: &str,
+) -> Option<Result<CommunityStatus, String>> {
+    let cache = state.status.lock().await;
+    let hit = cache.get(alias)?;
+    let ttl = if hit.result.is_ok() {
+        STATUS_TTL
+    } else {
+        STATUS_FAILURE_TTL
+    };
+    (hit.fetched.elapsed() < ttl).then(|| hit.result.clone())
+}
+
+async fn status_uncached(
     client: &Client,
     state: &CommunityState,
     alias: &str,

@@ -6,6 +6,41 @@ All notable changes to omarchy-yapperd. The format follows
 
 ## [Unreleased]
 
+### Changed
+- Opening a room now warms the send path in the background. Sync uses lazy
+  member loading, so the SDK's first encrypted send downloads the room's
+  member list and queries device keys for members it has never seen before it
+  can share the room key and post the event; those requests now happen while
+  the room is being read, and Enter only has to do the share and the send.
+  Small rooms also have untracked members' keys fetched up front.
+- Requests that take longer than 400 ms are logged as `slow request` with
+  their command name; `RUST_LOG=omarchy_yapperd=debug` logs every request
+  with its duration, and every message send with how long it took.
+
+### Fixed
+- The community status is cached for 30 s (60 s for a failure) and concurrent
+  lookups share one request; the alias lookup also gives up after one attempt
+  instead of three. `community_status` used to resolve the space alias on
+  every call, and an alias the homeserver cannot resolve (a 502 after 10 s)
+  meant each refresh cost ~30 s. Once eight of those were in flight, the
+  connection stopped reading new request lines, so an unrelated send sat
+  unread until a slow lookup finished. That was the "sometimes Enter takes a
+  while" case.
+- At most 32 requests run at once per connection (was 8): a burst of slow
+  optional requests no longer stops a send from being read.
+- The first room-list request after a restart is answered from a snapshot
+  taken before the initial sync instead of waiting behind that sync's store
+  writes; once the sync has run, the list is rebuilt as before.
+- The room list is built with eight rooms in flight rather than one at a
+  time. The first call after a start asks each room for its latest activity
+  (classic sync carries no recency stamp), which was 1.6 s of serial round
+  trips on this account.
+- The room list no longer re-parses every cached event of every room on each
+  refresh. The cache scan that counts unreads hidden behind a read receipt
+  left on paged history now runs only when the SDK's own counter cannot
+  answer (it is zero and something arrived after the receipt); fully read
+  rooms and rooms the counter already counts are skipped.
+
 ## [1.0.2]
 
 ### Security

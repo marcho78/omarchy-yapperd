@@ -14,7 +14,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use matrix_sdk::{
-    Client, LoopCtrl, Room, RoomState, SessionChange,
+    Client, LoopCtrl, Room, RoomMemberships, RoomState, SessionChange,
     authentication::{
         matrix::MatrixSession,
         oauth::{
@@ -63,7 +63,7 @@ use rand::{RngExt, distr::Alphanumeric, rng};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{sync::broadcast, task::JoinHandle};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::protocol::{
@@ -173,6 +173,13 @@ pub struct Core {
     prefs: Arc<tokio::sync::Mutex<crate::community::Prefs>>,
     /// Cached space hierarchy and the background joiner.
     community: Arc<crate::community::CommunityState>,
+    /// Rooms whose send path has been warmed (member list and device keys),
+    /// with when; opening a room again after a while warms it again.
+    warmed: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    /// The room list as it stood before the first sync of this session,
+    /// with the user it belongs to and when it was taken. Served while that
+    /// sync is still writing to the store, so the first paint is immediate.
+    rooms_cache: tokio::sync::Mutex<Option<(String, std::time::Instant, Vec<RoomInfo>)>>,
 }
 
 #[derive(Clone)]
@@ -198,6 +205,8 @@ impl Core {
             activity: Default::default(),
             prefs,
             community: Default::default(),
+            warmed: Default::default(),
+            rooms_cache: Default::default(),
         }))
     }
 
@@ -297,6 +306,13 @@ impl Core {
             secrets = ?saved.secrets,
             "session restored"
         );
+        // Take the room list before the sync starts; the shell's first
+        // request then paints at once instead of waiting behind the initial
+        // sync's store writes.
+        let user = client.user_id().map(|u| u.to_string()).unwrap_or_default();
+        if let Ok(list) = self.rooms_for(&client).await {
+            *self.rooms_cache.lock().await = Some((user, std::time::Instant::now(), list));
+        }
         self.start(client, saved.sync_token).await;
         Ok(())
     }
@@ -376,10 +392,85 @@ impl Core {
             }
         };
         let id = req.id.clone();
-        match self.dispatch(req.command).await {
+        let cmd = req.command.name();
+        let started = std::time::Instant::now();
+        let result = self.dispatch(req.command).await;
+        // A send that has to fetch a member list or device keys first is the
+        // usual reason Enter feels slow; say so when a request passes this.
+        let ms = started.elapsed().as_millis() as u64;
+        if ms >= 400 {
+            warn!(cmd, ms, "slow request");
+        } else {
+            debug!(cmd, ms, "request");
+        }
+        match result {
             Ok(v) => Response::ok(id, v),
             Err(e) => Response::err(id, format!("{e:#}")),
         }
+    }
+
+    /// Get the first encrypted send's side work out of the way when a room
+    /// is opened: sync uses lazy member loading, so the SDK's first send
+    /// downloads the member list, queries device keys for everyone it has
+    /// never seen, and only then shares the room key. Any of those can wait
+    /// on this homeserver or on a remote one federating a member's keys.
+    fn warm_send_path(&self, room: &Room) {
+        let key = room.room_id().to_string();
+        let now = std::time::Instant::now();
+        {
+            let mut warmed = self.warmed.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(at) = warmed.get(&key)
+                && now.duration_since(*at) < Duration::from_secs(5 * 60)
+            {
+                return;
+            }
+            warmed.insert(key.clone(), now);
+            if warmed.len() > 200 {
+                warmed.retain(|_, at| now.duration_since(*at) < Duration::from_secs(30 * 60));
+            }
+        }
+        let room = room.clone();
+        tokio::spawn(async move {
+            let encrypted = room
+                .latest_encryption_state()
+                .await
+                .map(|s| s.is_encrypted())
+                .unwrap_or(false);
+            if !encrypted {
+                return;
+            }
+            if !room.are_members_synced()
+                && let Err(e) = room.sync_members().await
+            {
+                debug!("warming the member list of {key}: {e:#}");
+                return;
+            }
+            let Ok(members) = room.members_no_sync(RoomMemberships::ACTIVE).await else {
+                return;
+            };
+            debug!(room = %key, members = members.len(), "member list warmed");
+            // The SDK exposes no batched device query, so ask for members one
+            // by one; that is cheap for the small rooms where a send is worth
+            // warming, and big rooms keep the SDK's batched query at send
+            // time. Failures here are only a missed head start.
+            if members.is_empty() || members.len() > 20 {
+                return;
+            }
+            let encryption = room.client().encryption();
+            let Ok(tracked) = encryption.tracked_users().await else {
+                return; // the crypto machine is not up yet; the send will do it
+            };
+            for member in members {
+                if tracked.contains(member.user_id()) {
+                    continue;
+                }
+                if let Err(e) = encryption.request_user_identity(member.user_id()).await {
+                    debug!("warming keys for {}: {e:#}", member.user_id());
+                    break;
+                }
+            }
+            debug!(room = %key, "send path warmed");
+        });
     }
 
     async fn dispatch(self: &Arc<Self>, cmd: Command) -> Result<Value> {
@@ -604,14 +695,17 @@ impl Core {
                 theme,
             } => {
                 let client = self.client().await?;
-                Ok(serde_json::to_value(
+                let profile =
                     crate::community::publish_profile(&client, &alias, bio, open_to_dm, theme)
-                        .await?,
-                )?)
+                        .await?;
+                // The status cache holds the old card.
+                self.community.forget(&alias).await;
+                Ok(serde_json::to_value(profile)?)
             }
             Command::ClearProfile { alias } => {
                 let client = self.client().await?;
                 crate::community::clear_profile(&client, &alias).await?;
+                self.community.forget(&alias).await;
                 Ok(json!({}))
             }
             Command::People {
@@ -641,13 +735,20 @@ impl Core {
                 )?)
             }
             Command::SetDmPolicy { policy, community } => {
-                let mut p = self.prefs.lock().await;
-                p.dm_policy = policy;
-                if !community.is_empty() {
-                    p.community = community;
+                let (alias, prefs) = {
+                    let mut p = self.prefs.lock().await;
+                    p.dm_policy = policy;
+                    if !community.is_empty() {
+                        p.community = community;
+                    }
+                    write_private(&self.prefs_file(), &serde_json::to_vec(&*p)?)?;
+                    (p.community.clone(), p.clone())
+                };
+                // The status answers with the policy it was computed under.
+                if !alias.is_empty() {
+                    self.community.forget(&alias).await;
                 }
-                write_private(&self.prefs_file(), &serde_json::to_vec(&*p)?)?;
-                Ok(serde_json::to_value(&*p)?)
+                Ok(serde_json::to_value(&prefs)?)
             }
             Command::CreateSpace { name, topic, alias } => {
                 let client = self.client().await?;
@@ -1315,15 +1416,53 @@ impl Core {
     // ---------- rooms ----------
 
     async fn rooms(&self) -> Result<Vec<RoomInfo>> {
-        let client = self.client().await?;
-        let mut out = Vec::new();
-        for room in client.joined_rooms() {
-            // Spaces are folders, not chats; they come from `spaces`.
-            if room.is_space() {
-                continue;
-            }
-            out.push(self.room_info(&room).await);
+        // While the first sync runs the store is busy; the list taken at
+        // restore is good enough for the first paint. After that, and for
+        // anything older than a minute, the list is rebuilt.
+        let (syncing, user) = {
+            let st = self.state.lock().await;
+            (
+                st.syncing,
+                st.client
+                    .as_ref()
+                    .and_then(|c| c.user_id().map(|u| u.to_string())),
+            )
+        };
+        if !syncing
+            && let Some((cache_user, at, list)) = self.rooms_cache.lock().await.as_ref()
+            && at.elapsed() < Duration::from_secs(60)
+            && user.as_deref() == Some(cache_user.as_str())
+        {
+            return Ok(list.clone());
         }
+        let client = self.client().await?;
+        let out = self.rooms_for(&client).await?;
+        *self.rooms_cache.lock().await = Some((
+            user.unwrap_or_default(),
+            std::time::Instant::now(),
+            out.clone(),
+        ));
+        Ok(out)
+    }
+
+    async fn rooms_for(&self, client: &Client) -> Result<Vec<RoomInfo>> {
+        use futures_util::StreamExt;
+        let rooms: Vec<Room> = client
+            .joined_rooms()
+            .into_iter()
+            // Spaces are folders, not chats; they come from `spaces`.
+            .filter(|room| !room.is_space())
+            .collect();
+        // A room's info is mostly store reads, but the first list after a
+        // start also asks the server for each room's latest activity (the
+        // recency stamp only comes with sliding sync). Sequentially that was
+        // a second and a half of round trips for 35 rooms; eight at a time
+        // overlaps them without hammering the homeserver.
+        let mut out: Vec<RoomInfo> = futures_util::stream::iter(rooms)
+            .map(|room| async move { self.room_info(&room).await })
+            .buffer_unordered(8)
+            .collect()
+            .await;
         out.sort_by(|a, b| b.unread.cmp(&a.unread).then_with(|| a.name.cmp(&b.name)));
         Ok(out)
     }
@@ -1357,9 +1496,21 @@ impl Core {
         // The SDK's counter only resolves once the receipt's event has come
         // through sync; a receipt placed on paged history leaves it at 0. So
         // also count what the cache holds from others after we last read.
-        let mut unread = room.num_unread_messages();
+        let sdk_unread = room.num_unread_messages();
+        let mut unread = sdk_unread;
         let mut last_activity: Option<u64> = None;
-        if let Ok((cache, _guard)) = room.event_cache().await {
+        // The scan below exists for the case the SDK's counter cannot see:
+        // a read receipt left behind on history that came in by paging. It
+        // re-parses every cached event of the room, so skip it when the
+        // counter already has the answer, and when nothing arrived after the
+        // receipt (the common, fully read room).
+        let newest = room.recency_stamp().map(u64::from);
+        let missed_by_counter = match (sdk_unread, newest, read_at) {
+            (0, Some(newest), Some(at)) => newest > at,
+            _ => false,
+        };
+        if missed_by_counter && let Ok((cache, _guard)) = room.event_cache().await {
+            let scan_started = std::time::Instant::now();
             if let Ok(events) = cache.events().await {
                 let mut n = 0u64;
                 for ev in events {
@@ -1396,6 +1547,11 @@ impl Core {
                 }
                 unread = unread.max(n);
             }
+            debug!(
+                room = %room.room_id(),
+                ms = scan_started.elapsed().as_millis() as u64,
+                "unread scan"
+            );
         }
         let direct = room.is_direct().await.unwrap_or(false);
         let (notification_mode, _) = self.notification_mode(&room, encrypted, direct).await;
@@ -1597,6 +1753,7 @@ impl Core {
     ) -> Result<TimelinePage> {
         let started = std::time::Instant::now();
         let room = self.room(room_id).await?;
+        self.warm_send_path(&room);
         let limit = limit.clamp(1, 200) as usize;
         let before = before.filter(|t| !t.is_empty());
         let (cache, _handles) = room
@@ -2100,7 +2257,13 @@ impl Core {
             }
             None => RoomMessageEventContent::text_markdown(body),
         };
+        let started = std::time::Instant::now();
         let resp = room.send(content).await.context("sending")?;
+        debug!(
+            room = %room_id,
+            ms = started.elapsed().as_millis() as u64,
+            "event sent"
+        );
         Ok(resp.response.event_id.to_string())
     }
 
@@ -2880,6 +3043,7 @@ impl Core {
             (a, b) => a.or(b),
         };
         if known.is_none() {
+            let started = std::time::Instant::now();
             let mut opts = MessagesOptions::backward();
             opts.limit = UInt::from(20u32);
             if let Ok(page) = room.messages(opts).await {
@@ -2897,6 +3061,11 @@ impl Core {
                     }
                 }
             }
+            debug!(
+                room = %key,
+                ms = started.elapsed().as_millis() as u64,
+                "activity fetched"
+            );
             self.activity.lock().await.insert(key, best.unwrap_or(0));
         }
         best.filter(|&t| t > 0)
