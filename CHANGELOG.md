@@ -6,6 +6,22 @@ All notable changes to omarchy-yapperd. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- Setting up encryption on a homeserver that asks for the account password
+  again (`User-Interactive Authentication`, e.g. Synapse with password login)
+  failed with nothing but "User-Interactive Authentication required." The
+  daemon now answers `reauth_required`, the plugin asks for the password, and
+  the cross-signing upload is retried inside the homeserver's UIA session. The
+  password is used once and never stored.
+- "They match" during device verification failed with `unknown verification
+  <id>`: the flow was removed from the id map as soon as the SAS started, so
+  the confirm could not find it. The entry now lives until the SAS finishes.
+- An account with a cross-signing identity but no usable secret storage (for
+  example one set up on a device whose recovery key is lost) had no way
+  forward: "Use recovery key" failed and "Set up encryption" was hidden. The
+  menu now offers "Make a new recovery key" in that state, which re-keys
+  secret storage and turns key backup on.
+
 ## [1.0.2]
 
 ### Security

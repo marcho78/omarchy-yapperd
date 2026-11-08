@@ -321,7 +321,16 @@ pub enum Command {
     },
     /// First device: set up cross-signing, secret storage and backup.
     /// Returns the recovery key, shown once.
-    SetupRecovery,
+    ///
+    /// Some homeservers (Synapse with password login, among others) ask for
+    /// the account password again before they accept a new cross-signing
+    /// identity. The first call leaves `password` out: the daemon answers with
+    /// `code: "reauth_required"` and the client asks for it, then repeats the
+    /// command with `password` set. The password is used once and dropped.
+    SetupRecovery {
+        #[serde(default)]
+        password: Option<String>,
+    },
     /// Replace the recovery key with a new one (the old one stops working).
     /// Returns the new key, shown once.
     ResetRecoveryKey,
@@ -390,6 +399,10 @@ pub struct Response {
     pub result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// A stable machine-readable reason, for errors the client acts on
+    /// differently (e.g. `reauth_required`); absent for ordinary errors.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
 }
 
 impl Response {
@@ -399,6 +412,7 @@ impl Response {
             ok: true,
             result: Some(result),
             error: None,
+            code: None,
         }
     }
     pub fn err(id: Value, error: impl ToString) -> Self {
@@ -407,6 +421,18 @@ impl Response {
             ok: false,
             result: None,
             error: Some(error.to_string()),
+            code: None,
+        }
+    }
+    /// An error the client is expected to handle: ask for the password again,
+    /// or show the reason rather than the raw daemon text.
+    pub fn err_code(id: Value, code: &str, error: impl ToString) -> Self {
+        Self {
+            id,
+            ok: false,
+            result: None,
+            error: Some(error.to_string()),
+            code: Some(code.to_owned()),
         }
     }
 }

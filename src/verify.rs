@@ -21,6 +21,7 @@ use matrix_sdk::{
     },
     ruma::{
         OwnedUserId,
+        api::client::uiaa,
         events::{
             key::verification::request::ToDeviceKeyVerificationRequestEvent,
             room::message::{MessageType, OriginalSyncRoomMessageEvent},
@@ -167,6 +168,7 @@ impl Core {
             .await
             .get(flow_id)
             .cloned()
+            .or_else(|| client.user_id().map(|u| u.to_owned()))
             .ok_or_else(|| anyhow!("unknown verification {flow_id}"))?;
         let req = client
             .encryption()
@@ -184,6 +186,7 @@ impl Core {
             .await
             .get(flow_id)
             .cloned()
+            .or_else(|| client.user_id().map(|u| u.to_owned()))
             .ok_or_else(|| anyhow!("unknown verification {flow_id}"))?;
         match client.encryption().get_verification(&user, flow_id).await {
             Some(Verification::SasV1(sas)) => Ok(sas),
@@ -231,6 +234,13 @@ impl Core {
 
         let core = self.clone();
         tokio::spawn(async move {
+            // Once the SAS takes over, it owns the flow and removes it at the
+            // end; removing it here would make `verify_confirm` ("They match")
+            // answer "unknown verification" while the emoji are on screen.
+            let mut remove_when_done = true;
+            // Ready can start the SAS and Transitioned then report the same
+            // SAS; two change streams would emit every step twice.
+            let mut sas_tracked = false;
             let mut changes = request.changes();
             while let Some(state) = changes.next().await {
                 match state {
@@ -240,12 +250,19 @@ impl Core {
                         core.emit(&request, outgoing, "ready", Vec::new(), None);
                         // Whoever is ready first starts the emoji exchange;
                         // if the other side already did, Transitioned follows.
-                        if let Ok(Some(sas)) = request.start_sas().await {
+                        if !sas_tracked
+                            && let Ok(Some(sas)) = request.start_sas().await
+                        {
+                            sas_tracked = true;
+                            remove_when_done = false;
                             core.track_sas(request.clone(), sas, outgoing);
                         }
                     }
                     VerificationRequestState::Transitioned { verification } => {
-                        if let Verification::SasV1(sas) = verification {
+                        if let Verification::SasV1(sas) = verification
+                            && !sas_tracked
+                        {
+                            remove_when_done = false;
                             core.track_sas(request.clone(), sas, outgoing);
                         }
                         break;
@@ -266,7 +283,9 @@ impl Core {
                     }
                 }
             }
-            core.flows.lock().await.remove(&flow_id);
+            if remove_when_done {
+                core.flows.lock().await.remove(&flow_id);
+            }
         });
     }
 
@@ -316,6 +335,7 @@ impl Core {
                     | SasState::Accepted { .. } => {}
                 }
             }
+            core.flows.lock().await.remove(request.flow_id());
         });
     }
 
@@ -384,7 +404,13 @@ impl Core {
     /// First device on the account: create the cross-signing identity (which
     /// also signs this device), then secret storage and backup. Returns the
     /// recovery key to show exactly once.
-    pub(crate) async fn setup_recovery(&self) -> Result<String> {
+    ///
+    /// A homeserver may refuse a new cross-signing identity until the user
+    /// authenticates again (`User-Interactive Authentication`): Synapse with
+    /// password login does, GitHub/MAS accounts usually do not. Without a
+    /// password we surface [`ReauthRequired`] so the client can ask; with one
+    /// we retry the upload through the homeserver's UIA session.
+    pub(crate) async fn setup_recovery(&self, password: Option<String>) -> Result<String> {
         let client = self.client().await?;
         let enc = client.encryption();
         let has_master = enc
@@ -398,9 +424,7 @@ impl Core {
         if !has_master {
             // matrix.org (MAS) lets a first identity be uploaded without
             // re-authentication; a homeserver that asks for it surfaces here.
-            enc.bootstrap_cross_signing(None)
-                .await
-                .context("creating the cross-signing identity (the homeserver may require re-authentication)")?;
+            bootstrap_cross_signing(&client, password).await?;
             info!("cross-signing identity created");
         }
         // A fresh store gets one key; a store we started earlier without the
@@ -420,6 +444,65 @@ impl Core {
         };
         let _ = self.events().send(Event::VerificationStatusChanged);
         Ok(key)
+    }
+}
+
+/// The homeserver wants the user's password again before it will accept a new
+/// cross-signing identity. The client asks for it and repeats `setup_recovery`
+/// with `password` set.
+#[derive(Debug)]
+pub(crate) struct ReauthRequired;
+
+impl std::fmt::Display for ReauthRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "your homeserver wants your password again to set up encryption"
+        )
+    }
+}
+
+impl std::error::Error for ReauthRequired {}
+
+/// Upload the cross-signing identity, answering a `User-Interactive
+/// Authentication` challenge with the password when the client supplied one.
+async fn bootstrap_cross_signing(client: &Client, password: Option<String>) -> Result<()> {
+    let enc = client.encryption();
+    let challenge = match enc.bootstrap_cross_signing(None).await {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    // Anything that is not a UIA challenge (network, server error) is not the
+    // client's to solve.
+    let Some(info) = challenge.as_uiaa_response() else {
+        return Err(challenge)
+            .context("creating the cross-signing identity (the homeserver may require re-authentication)");
+    };
+    let Some(password) = password else {
+        return Err(ReauthRequired.into());
+    };
+    let user_id = client
+        .user_id()
+        .ok_or_else(|| anyhow!("not logged in"))?
+        .to_owned();
+    let mut auth = uiaa::Password::new(
+        uiaa::UserIdentifier::Matrix(uiaa::MatrixUserIdentifier::new(user_id.to_string())),
+        password,
+    );
+    // The session ties this attempt to the challenge the server just issued.
+    auth.session = info.session.clone();
+    match enc
+        .bootstrap_cross_signing(Some(uiaa::AuthData::Password(auth)))
+        .await
+    {
+        Ok(()) => Ok(()),
+        // A wrong password comes back as another challenge, not a plain error.
+        Err(e) if e.as_uiaa_response().is_some() => {
+            Err(ReauthRequired).context("that password was not accepted")
+        }
+        Err(e) => {
+            Err(e).context("creating the cross-signing identity with the password")
+        }
     }
 }
 

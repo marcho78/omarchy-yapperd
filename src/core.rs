@@ -378,6 +378,11 @@ impl Core {
         let id = req.id.clone();
         match self.dispatch(req.command).await {
             Ok(v) => Response::ok(id, v),
+            // The client is expected to ask for the password again and repeat
+            // the command with it; every other error is just text.
+            Err(e) if e.downcast_ref::<crate::verify::ReauthRequired>().is_some() => {
+                Response::err_code(id, "reauth_required", format!("{e:#}"))
+            }
             Err(e) => Response::err(id, format!("{e:#}")),
         }
     }
@@ -731,8 +736,8 @@ impl Core {
                 self.recover(&key).await?;
                 Ok(serde_json::to_value(self.verification_status().await?)?)
             }
-            Command::SetupRecovery => {
-                let key = self.setup_recovery().await?;
+            Command::SetupRecovery { password } => {
+                let key = self.setup_recovery(password).await?;
                 Ok(json!({ "recovery_key": key }))
             }
             Command::ResetRecoveryKey => {
